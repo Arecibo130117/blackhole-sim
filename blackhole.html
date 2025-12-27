@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Black Hole Lensing</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { display:block; }
+
+    /* Control bar */
+    .ui {
+      position: fixed;
+      left: 12px; top: 12px;
+      z-index: 10;
+      color: #eaeaea;
+      font: 13px/1.25 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: rgba(10,10,14,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 10px 12px;
+      backdrop-filter: blur(8px);
+      user-select: none;
+      min-width: 260px;
+    }
+    .row { display:flex; align-items:center; gap:10px; margin: 8px 0; }
+    .row label { width: 92px; opacity: 0.9; }
+    .row input[type="range"] { width: 160px; }
+    .row input[type="number"]{
+      width: 120px;
+      padding: 4px 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.16);
+      background: rgba(0,0,0,0.35);
+      color: #fff;
+      outline: none;
+    }
+    .hint { opacity: 0.75; margin-top: 6px; font-size: 12px; }
+    .pill {
+      display:inline-block; padding: 2px 8px; border-radius: 999px;
+      background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.10);
+      margin-left: 6px; font-size: 12px; opacity: 0.9;
+    }
+  </style>
+
+  <!-- Three.js via importmap -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="ui">
+    <div class="row">
+      <label>Star count</label>
+      <input id="stars" type="range" min="1000" max="200000" step="1000" value="50000" />
+      <span id="starsVal" class="pill">50000</span>
+    </div>
+
+    <div class="row">
+      <label>BH mass</label>
+      <!-- no max: "don't limit the mass" -->
+      <input id="mass" type="number" value="12" step="1" />
+      <span class="pill">no cap</span>
+    </div>
+
+    <div class="hint">
+      Drag to rotate • Scroll to zoom (no limit) • Right-drag to pan<br/>
+      Lensing is approximated via screen-space distortion (fast + dramatic).
+    </div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+    // -------------------------
+    // Renderer / Scene / Camera
+    // -------------------------
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x000000, 0.000015);
+
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 20000);
+    camera.position.set(0, 90, 220);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.rotateSpeed = 0.55;
+    controls.zoomSpeed = 1.2;
+    // "don't limit the zoom" => do not set maxDistance; keep min very small
+    controls.minDistance = 0.001;
+    // controls.maxDistance intentionally not set
+
+    // -------------------------
+    // Lights (subtle)
+    // -------------------------
+    scene.add(new THREE.AmbientLight(0x111118, 1.0));
+    const rim = new THREE.DirectionalLight(0xbfd6ff, 0.6);
+    rim.position.set(1, 2, 1);
+    scene.add(rim);
+
+    // -------------------------
+    // Black hole core sizing (UPDATED)
+    // -------------------------
+    const BASE_MASS = 12.0;
+
+    // ======== YOU ADJUST THESE ========
+    // Smaller center: lower BH_CORE_BASE and/or BH_CORE_K
+    const BH_CORE_BASE = 12.0;     // was 18.0
+    const BH_CORE_K = 1.0;         // proportional constant (try 0.7, 0.55, etc.)
+    const BH_CORE_MASS_EXP = 0.50; // how strongly core grows with mass
+
+    // Photon ring relative size
+    const PHOTON_RING_BASE = 15.0; // was 21.0
+    const PHOTON_RING_K = 1.0;
+    const PHOTON_RING_MASS_EXP = 0.45;
+
+    function coreScaleFromMass(m){
+      const mm = Math.max(0.0, m);
+      return Math.pow(mm / BASE_MASS, BH_CORE_MASS_EXP);
+    }
+    function ringScaleFromMass(m){
+      const mm = Math.max(0.0, m);
+      return Math.pow(mm / BASE_MASS, PHOTON_RING_MASS_EXP);
+    }
+    function coreRadiusForMass(m){
+      return BH_CORE_BASE * BH_CORE_K * coreScaleFromMass(m);
+    }
+    function photonRadiusForMass(m){
+      return PHOTON_RING_BASE * PHOTON_RING_K * ringScaleFromMass(m);
+    }
+
+    // -------------------------
+    // Black hole core (event horizon + photon ring glow)
+    // -------------------------
+    const bhGroup = new THREE.Group();
+    scene.add(bhGroup);
+
+    const eventHorizon = new THREE.Mesh(
+      new THREE.SphereGeometry(coreRadiusForMass(BASE_MASS), 64, 64),
+      new THREE.MeshBasicMaterial({ color: 0x000000 })
+    );
+    bhGroup.add(eventHorizon);
+
+    // "Photon ring" glow shell
+    const photonRing = new THREE.Mesh(
+      new THREE.SphereGeometry(photonRadiusForMass(BASE_MASS), 96, 96),
+      new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uInner: { value: 0.55 },
+          uOuter: { value: 1.0 }
+        },
+        vertexShader: `
+          varying vec3 vPos;
+          void main(){
+            vPos = position;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vPos;
+          uniform float uTime;
+          uniform float uInner;
+          uniform float uOuter;
+
+          float hash(vec2 p){
+            p = fract(p*vec2(123.34, 345.45));
+            p += dot(p, p+34.345);
+            return fract(p.x*p.y);
+          }
+
+          void main(){
+            float r = length(vPos);
+            float n = hash(vPos.xy*0.25 + uTime*0.02);
+
+            // normalize by current geometry radius so look stays consistent
+            // (vPos is in object space; its max length is ~sphere radius)
+            float rr = r / max(1e-6, length(vPos) + 1e-6); // harmless, but keeps compiler happy
+            rr = r / r; // = 1, but we don't actually need rr; keep original style below
+
+            // Keep original aesthetic: use r normalized by approx radius (PHOTON_RING_BASE at mass=BASE_MASS)
+            float ring = smoothstep(uInner, uOuter, r / ${PHOTON_RING_BASE.toFixed(1)}) *
+                         (1.0 - smoothstep(uOuter, uOuter+0.08, r / ${PHOTON_RING_BASE.toFixed(1)}));
+
+            float flick = 0.55 + 0.45*sin(uTime*1.2 + n*6.2831);
+            float a = ring * flick * 0.55;
+
+            float boost = 0.65 + 0.35*clamp((vPos.x*0.02 + 0.5), 0.0, 1.0);
+            vec3 col = vec3(1.0, 0.82, 0.55) * boost;
+
+            gl_FragColor = vec4(col, a);
+          }
+        `
+      })
+    );
+    bhGroup.add(photonRing);
+
+    function updateBlackHoleCoreFromMass(m){
+      const rCore = coreRadiusForMass(m);
+      const rRing = photonRadiusForMass(m);
+
+      eventHorizon.geometry.dispose();
+      eventHorizon.geometry = new THREE.SphereGeometry(rCore, 64, 64);
+
+      photonRing.geometry.dispose();
+      photonRing.geometry = new THREE.SphereGeometry(rRing, 96, 96);
+    }
+
+    // -------------------------
+    // Accretion disk (existing)
+    // -------------------------
+    const DISK_BASE_INNER = 32.0;
+    const DISK_BASE_OUTER = 190.0;
+
+    const GLOW_BASE_INNER = 38.0;
+    const GLOW_BASE_OUTER = 235.0;
+
+    function diskScaleFromMass(m){
+      const mm = Math.max(0.0, m);
+      return Math.pow(mm / BASE_MASS, 0.60);
+    }
+    function diskRadiiForMass(m){
+      const s = diskScaleFromMass(m);
+      return { inner: DISK_BASE_INNER * s, outer: DISK_BASE_OUTER * s };
+    }
+    function glowRadiiForMass(m){
+      const s = diskScaleFromMass(m);
+      return { inner: GLOW_BASE_INNER * s, outer: GLOW_BASE_OUTER * s };
+    }
+
+    const disk = new THREE.Mesh(
+      new THREE.RingGeometry(DISK_BASE_INNER, DISK_BASE_OUTER, 512, 2),
+      new THREE.ShaderMaterial({
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uMass: { value: 12.0 },
+          uInner: { value: DISK_BASE_INNER },
+          uOuter: { value: DISK_BASE_OUTER },
+          uTilt: { value: 0.18 }
+        },
+        vertexShader: `
+          varying vec3 vPos;
+          varying vec2 vUv2;
+          void main(){
+            vPos = position;
+            vUv2 = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec3 vPos;
+          varying vec2 vUv2;
+
+          uniform float uTime;
+          uniform float uMass;
+          uniform float uInner;
+          uniform float uOuter;
+          uniform float uTilt;
+
+          float hash(vec2 p){
+            p = fract(p*vec2(123.34, 345.45));
+            p += dot(p, p+34.345);
+            return fract(p.x*p.y);
+          }
+          float noise(vec2 p){
+            vec2 i = floor(p), f = fract(p);
+            float a = hash(i);
+            float b = hash(i+vec2(1.0,0.0));
+            float c = hash(i+vec2(0.0,1.0));
+            float d = hash(i+vec2(1.0,1.0));
+            vec2 u = f*f*(3.0-2.0*f);
+            return mix(a,b,u.x) + (c-a)*u.y*(1.0-u.x) + (d-b)*u.x*u.y;
+          }
+          float fbm(vec2 p){
+            float v = 0.0;
+            float a = 0.5;
+            for(int i=0;i<5;i++){
+              v += a*noise(p);
+              p *= 2.0;
+              a *= 0.5;
+            }
+            return v;
+          }
+
+          void main(){
+            float r = length(vPos.xy);
+            float t = atan(vPos.y, vPos.x);
+
+            float inner = uInner;
+            float outer = uOuter;
+
+            float mask = smoothstep(inner, inner+2.5, r) * (1.0 - smoothstep(outer-2.5, outer, r));
+            if(mask <= 0.0) discard;
+
+            float speed = (uMass) / max(r, 1.0);
+            float swirl = t + uTime*(0.35 + speed*0.18);
+
+            vec2 p = vec2(swirl*2.2, r*0.055) + vec2(uTime*0.04, -uTime*0.02);
+            float turb = fbm(p*2.0) * 0.7 + fbm(p*5.0) * 0.3;
+
+            float bands = sin(swirl*14.0 + turb*6.0 + r*0.12);
+            bands = 0.5 + 0.5*bands;
+
+            float x = clamp((r - inner) / (outer - inner), 0.0, 1.0);
+            float heat = pow(1.0 - x, 1.6);
+
+            float dop = clamp(0.6 + 0.4*cos(t - 0.9), 0.0, 1.0);
+            float flick = 0.85 + 0.15*sin(uTime*2.0 + turb*9.0);
+
+            float emission = mask * flick * (0.12 + 1.35*heat) * (0.55 + 0.95*bands) * (0.65 + 0.75*dop);
+
+            vec3 hot = vec3(1.0, 0.92, 0.75);
+            vec3 mid = vec3(1.0, 0.62, 0.25);
+            vec3 cool = vec3(0.55, 0.75, 1.0);
+
+            vec3 col = mix(cool, mid, pow(heat, 0.65));
+            col = mix(col, hot, pow(heat, 1.7));
+
+            float clump = smoothstep(0.25, 0.85, turb);
+            emission *= mix(0.75, 1.15, clump);
+
+            float alpha = emission * (0.20 + 0.80*heat);
+            gl_FragColor = vec4(col * emission, alpha);
+          }
+        `
+      })
+    );
+    disk.rotation.x = Math.PI * 0.5;
+    bhGroup.add(disk);
+
+    const diskGlow = new THREE.Mesh(
+      new THREE.RingGeometry(GLOW_BASE_INNER, GLOW_BASE_OUTER, 256, 1),
+      new THREE.ShaderMaterial({
+        transparent: true,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: { uTime: { value: 0 } },
+        vertexShader: `
+          varying vec3 vPos;
+          void main(){ vPos = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+        `,
+        fragmentShader: `
+          varying vec3 vPos;
+          uniform float uTime;
+          void main(){
+            float r = length(vPos.xy);
+            float a = smoothstep(30.0, 60.0, r) * (1.0 - smoothstep(120.0, 160.0, r));
+            float w = 0.6 + 0.4*sin(uTime*0.8 + r*0.15);
+            vec3 c = vec3(0.65, 0.8, 1.0);
+            gl_FragColor = vec4(c * a * 0.35 * w, a * 0.18 * w);
+          }
+        `
+      })
+    );
+    diskGlow.rotation.x = Math.PI * 0.5;
+    diskGlow.position.y = 1.6;
+    bhGroup.add(diskGlow);
+
+    function updateDiskSizeFromMass(m){
+      const dr = diskRadiiForMass(m);
+      const gr = glowRadiiForMass(m);
+
+      disk.geometry.dispose();
+      disk.geometry = new THREE.RingGeometry(dr.inner, dr.outer, 512, 2);
+      disk.material.uniforms.uInner.value = dr.inner;
+      disk.material.uniforms.uOuter.value = dr.outer;
+
+      diskGlow.geometry.dispose();
+      diskGlow.geometry = new THREE.RingGeometry(gr.inner, gr.outer, 256, 1);
+    }
+
+    // -------------------------
+    // Starfield (Points) + a featured star near the BH
+    // -------------------------
+    let starsPoints = null;
+
+    function buildStarfield(count){
+      if (starsPoints) {
+        scene.remove(starsPoints);
+        starsPoints.geometry.dispose();
+        starsPoints.material.dispose();
+        starsPoints = null;
+      }
+
+      const positions = new Float32Array(count * 3);
+      const colors = new Float32Array(count * 3);
+      const sizes = new Float32Array(count);
+
+      const color = new THREE.Color();
+      for (let i = 0; i < count; i++){
+        const u = Math.random();
+        const r = 700 + Math.pow(u, 0.35) * 8300;
+
+        const z = (Math.random()*2 - 1);
+        const a = Math.random() * Math.PI * 2;
+        const xy = Math.sqrt(1 - z*z);
+        const x = xy * Math.cos(a);
+        const y = xy * Math.sin(a);
+
+        const plane = (Math.random()*2 - 1) * 0.12;
+        const px = x * r;
+        const py = (y + plane) * r * 0.65;
+        const pz = z * r;
+
+        positions[i*3+0] = px;
+        positions[i*3+1] = py;
+        positions[i*3+2] = pz;
+
+        const temp = Math.random();
+        if (temp < 0.65) color.setRGB(1.0, 1.0, 1.0);
+        else if (temp < 0.82) color.setRGB(0.78, 0.86, 1.0);
+        else color.setRGB(1.0, 0.82, 0.65);
+
+        const b = 0.35 + Math.random()*0.9;
+        colors[i*3+0] = color.r * b;
+        colors[i*3+1] = color.g * b;
+        colors[i*3+2] = color.b * b;
+
+        // already random (kept)
+        sizes[i] = 0.7 + Math.random() * 2.6;
+      }
+
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      geom.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+
+      const mat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        uniforms: {
+          uTime: { value: 0 },
+          uPixelRatio: { value: renderer.getPixelRatio() }
+        },
+        vertexShader: `
+          attribute float aSize;
+          varying vec3 vColor;
+          uniform float uPixelRatio;
+          void main(){
+            vColor = color;
+            vec4 mv = modelViewMatrix * vec4(position, 1.0);
+            float s = aSize * uPixelRatio * (250.0 / max(80.0, -mv.z));
+            gl_PointSize = clamp(s, 1.0, 14.0);
+            gl_Position = projectionMatrix * mv;
+          }
+        `,
+        fragmentShader: `
+          precision highp float;
+          varying vec3 vColor;
+          void main(){
+            vec2 uv = gl_PointCoord * 2.0 - 1.0;
+            float d = dot(uv, uv);
+            float a = exp(-d * 2.6);
+            float core = exp(-d * 8.0);
+            vec3 col = vColor * (0.55 + 0.45*core);
+            gl_FragColor = vec4(col, a);
+          }
+        `
+      });
+
+      starsPoints = new THREE.Points(geom, mat);
+      scene.add(starsPoints);
+    }
+
+    // Featured star (random size UPDATED)
+    const closeStar = new THREE.Mesh(
+      new THREE.SphereGeometry(4.6, 32, 32),
+      new THREE.MeshStandardMaterial({
+        emissive: new THREE.Color(0xfff2d0),
+        emissiveIntensity: 3.0,
+        color: new THREE.Color(0xffffff),
+        roughness: 0.9,
+        metalness: 0.0
+      })
+    );
+    closeStar.position.set(70, 28, -40);
+    scene.add(closeStar);
+
+    const closeStarGlow = new THREE.Mesh(
+      new THREE.SphereGeometry(9.5, 32, 32),
+      new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        uniforms: { uTime: { value: 0 } },
+        vertexShader: `
+          varying vec3 vPos;
+          void main(){ vPos = position; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }
+        `,
+        fragmentShader: `
+          varying vec3 vPos;
+          uniform float uTime;
+          void main(){
+            float r = length(vPos);
+            float a = smoothstep(1.0, 0.0, r/9.5);
+            float w = 0.6 + 0.4*sin(uTime*2.2 + r*1.2);
+            vec3 c = vec3(1.0, 0.88, 0.65);
+            gl_FragColor = vec4(c * a * 0.6 * w, a * 0.35 * w);
+          }
+        `
+      })
+    );
+    closeStarGlow.position.copy(closeStar.position);
+    scene.add(closeStarGlow);
+
+    function randomizeCloseStarSize(){
+      // pick a random radius for the featured star
+      const r = 3.0 + Math.random() * 5.0; // 3..8
+      const base = 4.6;
+      const s = r / base;
+
+      closeStar.scale.setScalar(s);
+      closeStarGlow.scale.setScalar(s);
+
+      // keep glow "feeling" slightly larger
+      closeStarGlow.scale.multiplyScalar(1.0 + 0.12);
+    }
+    randomizeCloseStarSize();
+
+    // -------------------------
+    // Gravity lensing (post-process)
+    // -------------------------
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+
+    // How strongly camera zoom affects lensing:
+    // bigger => zooming in makes lensing much stronger
+    const LENS_ZOOM_STRENGTH = 1.15;
+
+    const LensingShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        uCenter: { value: new THREE.Vector2(0.5, 0.5) },
+        uMass: { value: 12.0 },
+        uTime: { value: 0 },
+        uAspect: { value: innerWidth / innerHeight },
+
+        // UPDATED: zoom factor from camera distance
+        uZoom: { value: 1.0 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main(){
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        uniform sampler2D tDiffuse;
+        uniform vec2 uCenter;
+        uniform float uMass;
+        uniform float uTime;
+        uniform float uAspect;
+        uniform float uZoom;
+        varying vec2 vUv;
+
+        void main(){
+          vec2 uv = vUv;
+          vec2 p = uv - uCenter;
+          p.x *= uAspect;
+
+          float r = length(p) + 1e-6;
+          float m = max(0.0, uMass);
+
+          // base distortion
+          float strength = (0.035 + 0.004*m) / (r*r + 0.015);
+
+          // UPDATED: scale with zoom (uZoom > 1 when camera is closer)
+          strength *= mix(1.0, uZoom, ${LENS_ZOOM_STRENGTH.toFixed(2)});
+
+          float shimmer = 0.0025 * sin(uTime*1.3 + r*18.0);
+
+          vec2 deflect = normalize(p) * (strength + shimmer);
+          vec2 tang = vec2(-deflect.y, deflect.x) * (0.12 * strength);
+
+          vec2 warped = uv - vec2(deflect.x/uAspect, deflect.y) + tang;
+
+          // absorption near center (event horizon look)
+          float shadow = smoothstep(0.06, 0.0, r);
+          vec3 col = texture2D(tDiffuse, warped).rgb;
+          col *= (1.0 - shadow*0.92);
+
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `
+    };
+
+    const lensPass = new ShaderPass(LensingShader);
+    composer.addPass(lensPass);
+
+    const tmpV = new THREE.Vector3();
+    const tmpBHWorld = new THREE.Vector3();
+    const REF_CAM_DIST = camera.position.length(); // reference from initial camera position
+
+    function updateLensCenterAndZoom(){
+      tmpV.set(0,0,0);
+      bhGroup.localToWorld(tmpV);
+      tmpV.project(camera);
+
+      const u = (tmpV.x * 0.5) + 0.5;
+      const v = (tmpV.y * 0.5) + 0.5;
+      lensPass.uniforms.uCenter.value.set(u, v);
+      lensPass.uniforms.uAspect.value = innerWidth / innerHeight;
+
+      // zoom factor: closer camera => larger uZoom
+      bhGroup.getWorldPosition(tmpBHWorld);
+      const camDist = camera.position.distanceTo(tmpBHWorld);
+      const z = (REF_CAM_DIST / Math.max(1e-3, camDist));
+      lensPass.uniforms.uZoom.value = THREE.MathUtils.clamp(z, 0.15, 8.0);
+    }
+
+    // -------------------------
+    // UI wiring
+    // -------------------------
+    const starsEl = document.getElementById("stars");
+    const starsVal = document.getElementById("starsVal");
+    const massEl = document.getElementById("mass");
+
+    function setStarCount(n){
+      starsVal.textContent = String(n);
+      buildStarfield(n);
+
+      // optional: also randomize featured star when you rebuild stars
+      randomizeCloseStarSize();
+    }
+
+    starsEl.addEventListener("input", () => {
+      const n = Number(starsEl.value);
+      starsVal.textContent = String(n);
+    });
+    starsEl.addEventListener("change", () => {
+      const n = Number(starsEl.value);
+      setStarCount(n);
+    });
+
+    function setMass(m){
+      disk.material.uniforms.uMass.value = m;
+      lensPass.uniforms.uMass.value = m;
+
+      updateDiskSizeFromMass(m);
+
+      // UPDATED: black hole core + photon ring also scale from mass
+      updateBlackHoleCoreFromMass(m);
+    }
+
+    massEl.addEventListener("input", () => {
+      const m = Number(massEl.value);
+      if (!Number.isFinite(m)) return;
+      setMass(m);
+    });
+
+    // initial
+    setStarCount(Number(starsEl.value));
+    setMass(Number(massEl.value));
+
+    // -------------------------
+    // Animation loop
+    // -------------------------
+    const clock = new THREE.Clock();
+
+    function animate(){
+      requestAnimationFrame(animate);
+      const t = clock.getElapsedTime();
+
+      controls.update();
+
+      bhGroup.rotation.y = t * 0.08;
+
+      photonRing.material.uniforms.uTime.value = t;
+      disk.material.uniforms.uTime.value = t;
+      diskGlow.material.uniforms.uTime.value = t;
+      closeStarGlow.material.uniforms.uTime.value = t;
+
+      if (starsPoints) starsPoints.material.uniforms.uTime.value = t;
+
+      lensPass.uniforms.uTime.value = t;
+      updateLensCenterAndZoom();
+
+      composer.render();
+    }
+    animate();
+
+    // -------------------------
+    // Resize handling
+    // -------------------------
+    addEventListener("resize", () => {
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      lensPass.uniforms.uAspect.value = innerWidth / innerHeight;
+
+      if (starsPoints) {
+        starsPoints.material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+      }
+    });
+  </script>
+</body>
+</html>
